@@ -1,0 +1,29 @@
+{
+  "id": 12345,
+  "title": "Moderately Complex JSON Example",
+  "is_published": true,
+  "last_updated": null,
+  "product manager": "Alice Smith",
+  "description": "This is a sample product.\nIt includes various data types\nto demonstrate PIML conversion.",
+  "author": {
+    "name": "Bob Johnson",
+    "email": "bob.j@example.com"
+  },
+  "tags": [
+    "json",
+    "piml",
+    "example"
+  ],
+  "revisions": [
+    {
+      "timestamp": "2023-10-27T10:00:00Z",
+      "notes": "Initial draft."
+    },
+    {
+      "timestamp": "2023-10-28T14:30:00Z",
+      "notes": "Added author info and tags."
+    }
+  ],
+  "metadata": {},
+  "related_ids": []
+}
