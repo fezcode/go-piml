@@ -292,6 +292,10 @@ func (e *Encoder) encodeString(v reflect.Value, indent int, inArray bool) error 
 			lineIndentStr = strings.Repeat("  ", lineIndent)
 		}
 		for _, line := range lines {
+			// Escape any line that starts with # to prevent it being parsed as a comment.
+			if strings.HasPrefix(line, "#") {
+				line = `\` + line
+			}
 			if _, err := e.w.Write([]byte(fmt.Sprintf("%s%s\n", lineIndentStr, line))); err != nil {
 				return err
 			}

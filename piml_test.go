@@ -730,3 +730,32 @@ func TestComments(t *testing.T) {
 		t.Fatalf("Description mismatch:\nExpected:\n%q\nGot:\n%q", expectedDesc, cfg.Description)
 	}
 }
+
+func TestEscapedHashRoundtrip(t *testing.T) {
+	type Note struct {
+		Content string `piml:"content"`
+	}
+
+	input := Note{
+		Content: "First line\n# Second line starts with a hash\nThird line.",
+	}
+
+	// Marshal the struct to PIML.
+	// The marshaller should escape the line starting with #.
+	pimlData, err := Marshal(input)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+
+	// Unmarshal the PIML back into a new struct.
+	// The unmarshaller should correctly handle the escaped hash.
+	var output Note
+	if err := Unmarshal(pimlData, &output); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+
+	// Verify that the roundtrip was successful.
+	if !reflect.DeepEqual(input, output) {
+		t.Fatalf("Roundtrip failed for escaped hash:\nInput:\n%+v\n\nOutput:\n%+v", input, output)
+	}
+}
