@@ -65,19 +65,22 @@ func (d *Decoder) peek() (*lineInfo, error) {
 	for d.s.Scan() {
 		fullLine := d.s.Text() // The original, unmodified line
 
-		// 1. Clean comments from the *full* line
+		// 1. Check for comments and escaped hashes.
+		trimmedForCommentCheck := strings.TrimSpace(fullLine)
+		if strings.HasPrefix(trimmedForCommentCheck, `\#`) {
+			// This is an escaped hash, not a comment.
+			// We need to remove the escape character before processing.
+			if idx := strings.Index(fullLine, `\`); idx != -1 {
+				fullLine = fullLine[:idx] + fullLine[idx+1:]
+			}
+		} else if strings.HasPrefix(trimmedForCommentCheck, "#") {
+			continue // It's a full-line comment, skip.
+		}
+
+		// The line is not a comment line.
 		cleanLine := fullLine
-		if commentIdx := strings.Index(cleanLine, "#"); commentIdx != -1 {
-			cleanLine = cleanLine[:commentIdx]
-		}
 
-		// 2. Check for blank lines
-		trimmedLine := strings.TrimSpace(cleanLine)
-		if trimmedLine == "" {
-			continue // Skip blank lines and comment-only lines
-		}
-
-		// 3. Calculate indentation
+		// 2. Calculate indentation
 		indent := 0
 		for _, r := range cleanLine {
 			if r == ' ' {
@@ -91,9 +94,17 @@ func (d *Decoder) peek() (*lineInfo, error) {
 			}
 		}
 
+		// 3. Check for blank lines (after calculating indent)
+		trimmedLine := strings.TrimSpace(cleanLine)
+		if trimmedLine == "" {
+			li := &lineInfo{indent: indent, lineType: lineBlank}
+			d.peekBuf = li
+			return li, nil
+		}
+
 		// 4. Parse the line based on its *trimmed* content
 		li := &lineInfo{indent: indent}
-		lineContent := strings.TrimSpace(cleanLine)
+		lineContent := trimmedLine // Use the trimmed line for parsing content
 
 		if strings.HasPrefix(lineContent, "> (") {
 			// > (item)
@@ -109,10 +120,8 @@ func (d *Decoder) peek() (*lineInfo, error) {
 			li.value = strings.TrimSpace(lineContent[1:])
 		} else if strings.HasPrefix(lineContent, "(") {
 			// (key) value  OR (key)
-			// It starts with '(', it MUST be a key.
 			closeParen := strings.Index(lineContent, ")")
 			if closeParen == -1 {
-				// It starts with '(' but has no ')'. This is a syntax error.
 				return nil, fmt.Errorf("%w: invalid key format, missing ')' (line: %q)", ErrSyntax, fullLine)
 			}
 			li.key = lineContent[1:closeParen]
@@ -148,45 +157,51 @@ func (d *Decoder) consume() {
 
 // decodeValue is the main recursive unmarshalling function.
 func (d *Decoder) decodeValue(v reflect.Value, currentIndent int) error {
-	line, err := d.peek()
-	if err != nil {
-		return err
-	}
-	if line == nil {
-		return nil // End of file
-	}
+	for { // Loop to skip any intermediate blank lines.
+		line, err := d.peek()
+		if err != nil {
+			return err
+		}
+		if line == nil {
+			return nil // End of file
+		}
 
-	// We must check indentation *first*.
-	// If the line is not indented deeper, it's not part of this value.
-	if line.indent <= currentIndent {
-		return nil
-	}
+		// If the line is not indented deeper, it's not part of this value.
+		if line.indent <= currentIndent {
+			return nil
+		}
 
-	// This is the core logic. What type of value is this?
-	// We decide based on the *first line* of the value.
-	switch line.lineType {
-	case lineKeyOnly, lineKeyValue:
-		// (key) or (key) value
-		// This is the start of an object.
-		return d.decodeObject(v, currentIndent)
+		// If it's a blank line, consume and peek at the next one.
+		if line.lineType == lineBlank {
+			d.consume()
+			continue
+		}
 
-	case lineArrayItem, lineArrayObject:
-		// > value  OR  > (item)
-		// This must be a slice.
-		return d.decodeSlice(v, currentIndent)
+		// We have a non-blank line, so we can process it.
+		switch line.lineType {
+		case lineKeyOnly, lineKeyValue:
+			// (key) or (key) value
+			// This is the start of an object.
+			return d.decodeObject(v, currentIndent)
 
-	case lineSetItem:
-		// >| value
-		return d.decodeSet(v, currentIndent)
+		case lineArrayItem, lineArrayObject:
+			// > value  OR  > (item)
+			// This must be a slice.
+			return d.decodeSlice(v, currentIndent)
 
-	case lineMultiLine:
-		//   value
-		// This must be a multi-line string.
-		return d.decodeMultiLineString(v, currentIndent)
+		case lineSetItem:
+			// >| value
+			return d.decodeSet(v, currentIndent)
 
-	default:
-		// Should be impossible
-		return fmt.Errorf("%w: unknown line type %v", ErrSyntax, line.lineType)
+		case lineMultiLine:
+			//   value
+			// This must be a multi-line string.
+			return d.decodeMultiLineString(v, currentIndent)
+
+		default:
+			// Should be impossible
+			return fmt.Errorf("%w: unknown line type %v", ErrSyntax, line.lineType)
+		}
 	}
 }
 
@@ -220,6 +235,12 @@ func (d *Decoder) decodeObject(v reflect.Value, currentIndent int) error {
 		}
 		if line == nil || line.indent <= currentIndent {
 			break // End of this object
+		}
+
+		// Skip blank lines between fields
+		if line.lineType == lineBlank {
+			d.consume()
+			continue
 		}
 
 		if line.lineType != lineKeyValue && line.lineType != lineKeyOnly {
@@ -262,12 +283,7 @@ func (d *Decoder) decodeObject(v reflect.Value, currentIndent int) error {
 		} else {
 			// (key)
 			// This is a complex value, recurse
-			//
-			// !!!!! THIS IS THE FIX !!!!!
-			// Consume the (key) line *before* recursing
-			d.consume()
-			// !!!!! END FIX !!!!!
-			//
+			d.consume() // Consume the (key) line before recursing
 			if err := d.decodeValue(targetV, line.indent); err != nil {
 				return fmt.Errorf("piml: error decoding field %q: %w", key, err)
 			}
@@ -304,6 +320,12 @@ func (d *Decoder) decodeSlice(v reflect.Value, currentIndent int) error {
 			break // End of array
 		}
 
+		// Skip blank lines between array items
+		if line.lineType == lineBlank {
+			d.consume()
+			continue
+		}
+
 		// Allocate a new element
 		// We pass a pointer to the element type to decodeValue/setPrimitive
 		elemVPtr := reflect.New(elemType)
@@ -324,8 +346,6 @@ func (d *Decoder) decodeSlice(v reflect.Value, currentIndent int) error {
 			}
 		} else {
 			// This line is not an array item, so we're done.
-			// This can happen if the array is followed by a key
-			// at the same indent level.
 			break
 		}
 
@@ -402,39 +422,37 @@ func (d *Decoder) decodeMultiLineString(v reflect.Value, currentIndent int) erro
 			break // End of multi-line string
 		}
 
-		if line.lineType != lineMultiLine {
-			// Not a multi-line string line, we're done.
+		// A valid line for a multi-line string can be blank or have content.
+		if line.lineType != lineMultiLine && line.lineType != lineBlank {
 			break
 		}
 
 		d.consume()
 
-		// The line.value is the full, indented line.
-		content := line.value
+		// Every line after the first adds a newline separator.
+		if baseIndent != -1 {
+			b.WriteString("\n")
+		}
 
-		// Set the base indentation from the first line
+		// Set base indent on the first line seen
 		if baseIndent == -1 {
 			baseIndent = line.indent
-			if b.Len() > 0 {
-				b.WriteString("\n")
-			}
-			// Add the content, stripping the base indent
-			if len(content) > baseIndent {
-				b.WriteString(content[baseIndent:])
-			} else {
-				// It's possible the line is just whitespace
-				b.WriteString(strings.TrimSpace(content))
-			}
+		}
+
+		if line.lineType == lineBlank {
+			// It's a blank line, we've added the newline, so we're done with this line.
+			continue
+		}
+
+		// It's a line with content (lineMultiLine)
+		content := line.value
+
+		// Add the content, stripping the base indent
+		if len(content) >= baseIndent {
+			b.WriteString(content[baseIndent:])
 		} else {
-			b.WriteString("\n")
-			// Strip the *base* indent from subsequent lines
-			if strings.HasPrefix(content, strings.Repeat(" ", baseIndent)) {
-				b.WriteString(content[baseIndent:])
-			} else {
-				// If a line is not indented, or less indented,
-				// just strip all leading space.
-				b.WriteString(strings.TrimSpace(content))
-			}
+			// Should not happen if indent was calculated correctly, but as a fallback...
+			b.WriteString(strings.TrimSpace(content))
 		}
 	}
 

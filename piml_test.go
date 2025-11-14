@@ -242,7 +242,7 @@ func TestKeysWithSpaces(t *testing.T) {
 func TestCommentHandling(t *testing.T) {
 	pimlData := []byte(`
 # This is a full-line comment
-(host) localhost # This is an inline comment
+(host) localhost # This is now part of the value
 # Another comment
 (port) 5432
 (description)
@@ -255,8 +255,8 @@ func TestCommentHandling(t *testing.T) {
 		t.Fatalf("Unmarshal() error = %v", err)
 	}
 
-	if output.Host != "localhost" {
-		t.Errorf("Expected Host 'localhost', got %q", output.Host)
+	if output.Host != "localhost # This is now part of the value" {
+		t.Errorf("Expected Host 'localhost # This is now part of the value', got %q", output.Host)
 	}
 	if output.Port != 5432 {
 		t.Errorf("Expected Port 5432, got %d", output.Port)
@@ -623,7 +623,7 @@ func TestStructTest(t *testing.T) {
 	}
 }
 
-func TestSomeMore(t *testing.T) {
+func TestMultineStringCorrectly(t *testing.T) {
 	type User struct {
 		ID   int    `piml:"id"`
 		Name string `piml:"name"`
@@ -653,6 +653,11 @@ func TestSomeMore(t *testing.T) {
 (description)
   This is a multi-line
   description for the site.
+  
+  as well
+  
+  
+  close
 `)
 
 	var cfg Config
@@ -662,10 +667,66 @@ func TestSomeMore(t *testing.T) {
 		return
 	}
 
+	expectedDesc := "This is a multi-line\ndescription for the site.\n\nas well\n\n\nclose"
+	if cfg.Description != expectedDesc {
+		// Use %q to make whitespace differences obvious.
+		t.Fatalf("Description mismatch:\nExpected:\n%q\nGot:\n%q", expectedDesc, cfg.Description)
+	}
+
 	t.Logf("%+v\n", cfg)
 	for _, admin := range cfg.Admins {
 		if !strings.HasPrefix(admin.Name, "Admin") {
 			t.Fatalf("Admin Name does not start with 'Admin'")
 		}
+	}
+}
+
+func TestMultilineWithError(t *testing.T) {
+	type Config struct {
+		SomeKey     string `piml:"some key"`
+		Description string `piml:"description"`
+	}
+
+	pimlData := []byte(`
+(some key) XXXX
+(description)
+  This is a multi-line
+  description for the site.
+
+  as well
+`)
+
+	var cfg Config
+	err := Unmarshal(pimlData, &cfg)
+	if err == nil {
+		t.Fatalf("No error on unmarshalling, should be some errors due to newlines: %v", err)
+	}
+}
+
+func TestComments(t *testing.T) {
+	type Config struct {
+		SomeKey     string `piml:"some key"`
+		Description string `piml:"description"`
+	}
+
+	pimlData := []byte(`
+(some key) XXXX
+(description)
+  This is a multi-line
+  description for the site.
+  # this is a comment and should be ignored
+  \# this line should start with a hash
+  as well
+`)
+
+	var cfg Config
+	err := Unmarshal(pimlData, &cfg)
+	if err != nil {
+		t.Fatalf("Error on unmarshalling: %v", err)
+	}
+
+	expectedDesc := "This is a multi-line\ndescription for the site.\n# this line should start with a hash\nas well"
+	if cfg.Description != expectedDesc {
+		t.Fatalf("Description mismatch:\nExpected:\n%q\nGot:\n%q", expectedDesc, cfg.Description)
 	}
 }

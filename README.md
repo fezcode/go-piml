@@ -10,7 +10,7 @@
 -   **Complex Types:** Handles structs, slices (arrays), and maps.
 -   **Nil Handling:** Explicitly represents `nil` for pointers, empty slices, and empty maps.
 -   **Multi-line Strings:** Supports multi-line string values with indentation.
--   **Comments:** Allows single-line and inline comments using `#`.
+-   **Comments:** Allows single-line comments (lines starting with `#`). Inline comments are not supported. In multi-line strings, a leading `#` can be escaped with a backslash (`\#`) to be treated as a literal character.
 -   **Time Support:** Marshals and unmarshals `time.Time` values using RFC3339Nano format.
 
 ## PIML Format Overview

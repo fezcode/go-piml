@@ -4,7 +4,7 @@
   "is_published": true,
   "last_updated": null,
   "product manager": "Alice Smith",
-  "description": "This is a sample product.\nIt includes various data types\nto demonstrate PIML conversion.",
+  "description": "This is a sample product.\nIt includes various data types.\n\n# This line starts with a hash.",
   "author": {
     "name": "Bob Johnson",
     "email": "bob.j@example.com"
