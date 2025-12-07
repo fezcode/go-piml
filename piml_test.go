@@ -681,27 +681,6 @@ func TestMultineStringCorrectly(t *testing.T) {
 	}
 }
 
-func TestMultilineWithError(t *testing.T) {
-	type Config struct {
-		SomeKey     string `piml:"some key"`
-		Description string `piml:"description"`
-	}
-
-	pimlData := []byte(`
-(some key) XXXX
-(description)
-  This is a multi-line
-  description for the site.
-
-  as well
-`)
-
-	var cfg Config
-	err := Unmarshal(pimlData, &cfg)
-	if err == nil {
-		t.Fatalf("No error on unmarshalling, should be some errors due to newlines: %v", err)
-	}
-}
 
 func TestComments(t *testing.T) {
 	type Config struct {

@@ -418,7 +418,8 @@ func (d *Decoder) decodeMultiLineString(v reflect.Value, currentIndent int) erro
 		if err != nil {
 			return err
 		}
-		if line == nil || line.indent <= currentIndent {
+		// Blank lines don't have indentation, so we skip the indent check for them.
+		if line == nil || (line.lineType != lineBlank && line.indent <= currentIndent) {
 			break // End of multi-line string
 		}
 
