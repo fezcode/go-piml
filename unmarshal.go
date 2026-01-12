@@ -166,15 +166,16 @@ func (d *Decoder) decodeValue(v reflect.Value, currentIndent int) error {
 			return nil // End of file
 		}
 
-		// If the line is not indented deeper, it's not part of this value.
-		if line.indent <= currentIndent {
-			return nil
-		}
-
 		// If it's a blank line, consume and peek at the next one.
+		// We do this BEFORE checking indentation so blank lines don't break blocks.
 		if line.lineType == lineBlank {
 			d.consume()
 			continue
+		}
+
+		// If the line is not indented deeper, it's not part of this value.
+		if line.indent <= currentIndent {
+			return nil
 		}
 
 		// We have a non-blank line, so we can process it.
@@ -233,14 +234,18 @@ func (d *Decoder) decodeObject(v reflect.Value, currentIndent int) error {
 		if err != nil {
 			return err
 		}
-		if line == nil || line.indent <= currentIndent {
-			break // End of this object
+		if line == nil {
+			break
 		}
 
 		// Skip blank lines between fields
 		if line.lineType == lineBlank {
 			d.consume()
 			continue
+		}
+
+		if line.indent <= currentIndent {
+			break // End of this object
 		}
 
 		if line.lineType != lineKeyValue && line.lineType != lineKeyOnly {
@@ -316,14 +321,18 @@ func (d *Decoder) decodeSlice(v reflect.Value, currentIndent int) error {
 		if err != nil {
 			return err
 		}
-		if line == nil || line.indent <= currentIndent {
-			break // End of array
+		if line == nil {
+			break
 		}
 
 		// Skip blank lines between array items
 		if line.lineType == lineBlank {
 			d.consume()
 			continue
+		}
+
+		if line.indent <= currentIndent {
+			break // End of array
 		}
 
 		// Allocate a new element
@@ -386,7 +395,17 @@ func (d *Decoder) decodeSet(v reflect.Value, currentIndent int) error {
 		if err != nil {
 			return err
 		}
-		if line == nil || line.indent <= currentIndent {
+		if line == nil {
+			break
+		}
+
+		// Skip blank lines between set items
+		if line.lineType == lineBlank {
+			d.consume()
+			continue
+		}
+
+		if line.indent <= currentIndent {
 			break // End of set
 		}
 
