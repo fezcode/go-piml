@@ -581,7 +581,17 @@ func findStructField(v reflect.Value, key string) (reflect.Value, error) {
 
 		// 1. Check tag
 		tag := fieldT.Tag.Get("piml")
-		if tag == key {
+		if tag == "-" {
+			continue
+		}
+
+		// Parse tag to get the name
+		tagName := tag
+		if idx := strings.Index(tag, ","); idx != -1 {
+			tagName = tag[:idx]
+		}
+
+		if tagName == key {
 			return fieldV, nil
 		}
 
@@ -591,12 +601,15 @@ func findStructField(v reflect.Value, key string) (reflect.Value, error) {
 		}
 
 		// 3. Recurse into anonymous/embedded structs *regardless* of tag
+		// Note: This logic for embedded structs is simplified and might not handle
+		// all edge cases of shadowing, but it fits the current style.
 		if fieldT.Anonymous && fieldT.Type.Kind() == reflect.Struct {
 			if f, err := findStructField(fieldV, key); err == nil {
 				return f, nil // Found in embedded struct
 			}
 		}
 	}
+	// Return a zero Value to indicate not found
 	return reflect.Value{}, fmt.Errorf("field %q not found", key)
 }
 
