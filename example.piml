@@ -1,0 +1,36 @@
+(videos)
+  > (Video)
+    (name) Tears by Health
+    (url) https://example.com/1
+
+  > (Video)
+    (name) Even Though - Morcheeba
+    (url) https://example.com/2
+
+  > (Video)
+    (name) Video 3
+    (url) https://example.com/3
+
+  > (Video)
+    (name) Video 4
+    (url) https://example.com/4
+
+  > (Video)
+    (name) Video 5
+    (url) https://example.com/5
+
+  > (Video)
+    (name) Video 6
+    (url) https://example.com/6
+
+  > (Video)
+    (name) Video 7
+    (url) https://example.com/7
+
+  > (Video)
+    (name) Video 8
+    (url) https://example.com/8
+
+  > (Video)
+    (name) Video 9
+    (url) https://example.com/9
