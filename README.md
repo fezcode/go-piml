@@ -9,6 +9,7 @@
 -   **Primitive Types:** Supports strings, integers, floats, and booleans.
 -   **Complex Types:** Handles structs, slices (arrays), and maps.
 -   **Nil Handling:** Explicitly represents `nil` for pointers, empty slices, and empty maps.
+-   **Omitempty Support:** Supports the `omitempty` struct tag option to skip fields with zero/empty values during marshalling.
 -   **Multi-line Strings:** Supports multi-line string values with indentation.
 -   **Comments:** Allows single-line comments (lines starting with `#`). Inline comments are not supported. In multi-line strings, a leading `#` can be escaped with a backslash (`\#`) to be treated as a literal character.
 -   **Time Support:** Marshals and unmarshals `time.Time` values using RFC3339Nano format.
@@ -85,6 +86,7 @@ type Config struct {
 	Admins      []*User   `piml:"admins"`
 	LastUpdated time.Time `piml:"last_updated"`
 	Description string    `piml:"description"`
+	OptionalVal string    `piml:"optional_val,omitempty"` // Will be omitted if empty
 }
 
 func main() {
@@ -98,6 +100,7 @@ func main() {
 		},
 		LastUpdated: time.Date(2023, time.November, 10, 15, 30, 0, 0, time.UTC),
 		Description: "This is a multi-line\ndescription for the site.",
+		OptionalVal: "", // Empty, so it won't appear in the output
 	}
 
 	pimlData, err := piml.Marshal(cfg)
