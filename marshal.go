@@ -176,12 +176,26 @@ func (e *Encoder) encodeStruct(v reflect.Value, indent int) error {
 		if tag == "-" {
 			continue // Skip this field
 		}
-		if tag == "" {
-			tag = strings.ToLower(field.Name)
+
+		tagName := tag
+		omitempty := false
+		if idx := strings.Index(tag, ","); idx != -1 {
+			tagName = tag[:idx]
+			if strings.Contains(tag[idx+1:], "omitempty") {
+				omitempty = true
+			}
+		}
+
+		if tagName == "" {
+			tagName = strings.ToLower(field.Name)
+		}
+
+		if omitempty && isEmptyValue(fieldV) {
+			continue
 		}
 
 		// Write the key
-		if _, err := e.w.Write([]byte(fmt.Sprintf("%s(%s)", indentStr, tag))); err != nil {
+		if _, err := e.w.Write([]byte(fmt.Sprintf("%s(%s)", indentStr, tagName))); err != nil {
 			return err
 		}
 
@@ -345,6 +359,25 @@ func isNilOrEmpty(v reflect.Value) bool {
 		return v.IsNil()
 	case reflect.Slice, reflect.Map:
 		return v.IsNil() || v.Len() == 0
+	}
+	return false
+}
+
+// isEmptyValue checks if a value is "empty" according to Go's struct tag rules for omitempty.
+func isEmptyValue(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
+		return v.Len() == 0
+	case reflect.Bool:
+		return !v.Bool()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return v.Int() == 0
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return v.Uint() == 0
+	case reflect.Float32, reflect.Float64:
+		return v.Float() == 0
+	case reflect.Interface, reflect.Ptr:
+		return v.IsNil()
 	}
 	return false
 }
