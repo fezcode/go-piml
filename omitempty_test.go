@@ -7,14 +7,14 @@ import (
 )
 
 type ComprehensiveOmitemptyStruct struct {
-	Name     string   `piml:"name,omitempty"`
-	Age      int      `piml:"age,omitempty"`
-	Price    float64  `piml:"price,omitempty"`
-	IsActive bool     `piml:"is_active,omitempty"`
-	Tags     []string `piml:"tags,omitempty"`
+	Name     string            `piml:"name,omitempty"`
+	Age      int               `piml:"age,omitempty"`
+	Price    float64           `piml:"price,omitempty"`
+	IsActive bool              `piml:"is_active,omitempty"`
+	Tags     []string          `piml:"tags,omitempty"`
 	Meta     map[string]string `piml:"meta,omitempty"`
-	Ptr      *int     `piml:"ptr,omitempty"`
-	Address  string   `piml:"address"` // Required field
+	Ptr      *int              `piml:"ptr,omitempty"`
+	Address  string            `piml:"address"` // Required field
 }
 
 func TestOmitempty_AllEmpty(t *testing.T) {
@@ -30,7 +30,7 @@ func TestOmitempty_AllEmpty(t *testing.T) {
 	}
 
 	got := buf.String()
-	
+
 	expectedMissing := []string{
 		"name", "age", "price", "is_active", "tags", "meta", "ptr",
 	}
@@ -40,7 +40,7 @@ func TestOmitempty_AllEmpty(t *testing.T) {
 			t.Errorf("Expected '%s' to be omitted, but it was found in output:\n%s", field, got)
 		}
 	}
-	
+
 	if !strings.Contains(got, "address") {
 		t.Errorf("Expected 'address' to be present, but it was missing.")
 	}
@@ -67,7 +67,7 @@ func TestOmitempty_NoneEmpty(t *testing.T) {
 	}
 
 	got := buf.String()
-	
+
 	expectedPresent := []string{
 		"name", "age", "price", "is_active", "tags", "meta", "ptr", "address",
 	}
@@ -96,7 +96,7 @@ func TestOmitempty_Partial(t *testing.T) {
 	}
 
 	got := buf.String()
-	
+
 	if !strings.Contains(got, "name") {
 		t.Errorf("Expected 'name' to be present.")
 	}

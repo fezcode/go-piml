@@ -1,509 +1,512 @@
 package piml
 
 import (
-	"bufio"
-	"bytes"
-	"errors"
 	"fmt"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
 
+// Type inference patterns, per PIML spec v1.2.0.
+var (
+	intPattern   = regexp.MustCompile(`^-?(0|[1-9][0-9]*)$`)
+	floatPattern = regexp.MustCompile(`^-?(0|[1-9][0-9]*)\.[0-9]+$`)
+)
+
 // A Decoder reads and decodes PIML values from an input byte slice.
 type Decoder struct {
-	s       *bufio.Scanner
-	peekBuf *lineInfo // Buffer for one-line lookahead
+	data []byte
 }
 
-// lineInfo stores the parsed data from a single line.
-type lineInfo struct {
-	indent   int    // Number of leading spaces
-	key      string // Key (if present)
-	value    string // Value (if present)
-	lineType lineType
+// rawLine is one significant line of the document. Comment lines are
+// dropped at scan time; blank lines are kept because multi-line string
+// blocks preserve them.
+type rawLine struct {
+	indent int    // number of leading spaces
+	text   string // content with indentation stripped (empty for blank lines)
+	blank  bool
+	num    int // 1-based line number, for error messages
 }
 
-// lineType categorizes the parsed line.
-type lineType int
-
-const (
-	lineBlank       lineType = iota // Empty or comment-only
-	lineKeyValue                    // (key) value
-	lineKeyOnly                     // (key)
-	lineArrayItem                   // > value
-	lineSetItem                     // >| value
-	lineArrayObject                 // > (item)
-	lineMultiLine                   //   value (indented, no key)
-)
+// parser walks the scanned lines.
+type parser struct {
+	lines []rawLine
+	pos   int
+}
 
 // NewDecoder returns a new decoder that reads from data.
 func NewDecoder(data []byte) *Decoder {
-	return &Decoder{
-		s: bufio.NewScanner(bytes.NewReader(data)),
-	}
+	return &Decoder{data: data}
 }
 
-// Decode reads the next PIML-encoded value from its
-// input and stores it in the value pointed to by v.
+// Decode reads the PIML document and stores it in the value pointed to by v.
 func (d *Decoder) Decode(v interface{}) error {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Ptr || rv.IsNil() {
 		return ErrInvalidUnmarshal
 	}
-	// We start with -1, as the root has no indentation.
-	return d.decodeValue(rv, -1)
+	p, err := scan(string(d.data))
+	if err != nil {
+		return err
+	}
+	// The document root is an implicit object at indentation level 0.
+	return p.decodeObject(rv, 0)
 }
 
-// peek gets the next line, parses it, and stores it in the buffer.
-func (d *Decoder) peek() (*lineInfo, error) {
-	if d.peekBuf != nil {
-		return d.peekBuf, nil
-	}
-
-	for d.s.Scan() {
-		fullLine := d.s.Text() // The original, unmodified line
-
-		// 1. Check for comments and escaped hashes.
-		trimmedForCommentCheck := strings.TrimSpace(fullLine)
-		if strings.HasPrefix(trimmedForCommentCheck, `\#`) {
-			// This is an escaped hash, not a comment.
-			// We need to remove the escape character before processing.
-			if idx := strings.Index(fullLine, `\`); idx != -1 {
-				fullLine = fullLine[:idx] + fullLine[idx+1:]
-			}
-		} else if strings.HasPrefix(trimmedForCommentCheck, "#") {
-			continue // It's a full-line comment, skip.
-		}
-
-		// The line is not a comment line.
-		cleanLine := fullLine
-
-		// 2. Calculate indentation
-		indent := 0
-		for _, r := range cleanLine {
-			if r == ' ' {
-				indent++
-			} else if r == '\t' {
-				// Per spec, tabs are not allowed.
-				return nil, fmt.Errorf("%w: tabs are not allowed (line: %q)", ErrSyntax, fullLine)
-			} else {
-				// We found the first non-space char
-				break
-			}
-		}
-
-		// 3. Check for blank lines (after calculating indent)
-		trimmedLine := strings.TrimSpace(cleanLine)
-		if trimmedLine == "" {
-			li := &lineInfo{indent: indent, lineType: lineBlank}
-			d.peekBuf = li
-			return li, nil
-		}
-
-		// 4. Parse the line based on its *trimmed* content
-		li := &lineInfo{indent: indent}
-		lineContent := trimmedLine // Use the trimmed line for parsing content
-
-		if strings.HasPrefix(lineContent, "> (") {
-			// > (item)
-			li.lineType = lineArrayObject
-			// Key is ignored, per spec
-		} else if strings.HasPrefix(lineContent, ">|") {
-			// >| value
-			li.lineType = lineSetItem
-			li.value = strings.TrimSpace(lineContent[2:])
-		} else if strings.HasPrefix(lineContent, ">") {
-			// > value
-			li.lineType = lineArrayItem
-			li.value = strings.TrimSpace(lineContent[1:])
-		} else if strings.HasPrefix(lineContent, "(") {
-			// (key) value  OR (key)
-			closeParen := strings.Index(lineContent, ")")
-			if closeParen == -1 {
-				return nil, fmt.Errorf("%w: invalid key format, missing ')' (line: %q)", ErrSyntax, fullLine)
-			}
-			li.key = lineContent[1:closeParen]
-			li.value = strings.TrimSpace(lineContent[closeParen+1:])
-
-			if li.value == "" {
-				li.lineType = lineKeyOnly
-			} else {
-				li.lineType = lineKeyValue
-			}
-		} else {
-			// A line with no key... must be multi-line string
-			li.lineType = lineMultiLine
-			// For multi-line, the value is the *full line*
-			// with its indentation preserved, post-comment-stripping.
-			li.value = cleanLine
-		}
-
-		d.peekBuf = li
-		return li, nil
-	}
-	if err := d.s.Err(); err != nil {
-		return nil, err
-	}
-	// End of file
-	return nil, nil
-}
-
-// consume moves the scanner past the buffered line.
-func (d *Decoder) consume() {
-	d.peekBuf = nil
-}
-
-// decodeValue is the main recursive unmarshalling function.
-func (d *Decoder) decodeValue(v reflect.Value, currentIndent int) error {
-	for { // Loop to skip any intermediate blank lines.
-		line, err := d.peek()
-		if err != nil {
-			return err
-		}
-		if line == nil {
-			return nil // End of file
-		}
-
-		// If it's a blank line, consume and peek at the next one.
-		// We do this BEFORE checking indentation so blank lines don't break blocks.
-		if line.lineType == lineBlank {
-			d.consume()
+// scan splits the input into significant lines. Tabs in indentation are
+// rejected; comment lines (first non-space char is an unescaped '#') are
+// dropped; a trailing '\r' is stripped from every line.
+func scan(input string) (*parser, error) {
+	rawLines := strings.Split(input, "\n")
+	lines := make([]rawLine, 0, len(rawLines))
+	for i, l := range rawLines {
+		num := i + 1
+		l = strings.TrimSuffix(l, "\r")
+		if strings.TrimSpace(l) == "" {
+			lines = append(lines, rawLine{blank: true, num: num})
 			continue
 		}
-
-		// If the line is not indented deeper, it's not part of this value.
-		if line.indent <= currentIndent {
-			return nil
+		indent := 0
+		for indent < len(l) {
+			if l[indent] == ' ' {
+				indent++
+				continue
+			}
+			if l[indent] == '\t' {
+				return nil, fmt.Errorf("%w: tabs are not allowed in indentation (line %d)", ErrSyntax, num)
+			}
+			break
 		}
-
-		// We have a non-blank line, so we can process it.
-		switch line.lineType {
-		case lineKeyOnly, lineKeyValue:
-			// (key) or (key) value
-			// This is the start of an object.
-			return d.decodeObject(v, currentIndent)
-
-		case lineArrayItem, lineArrayObject:
-			// > value  OR  > (item)
-			// This must be a slice.
-			return d.decodeSlice(v, currentIndent)
-
-		case lineSetItem:
-			// >| value
-			return d.decodeSet(v, currentIndent)
-
-		case lineMultiLine:
-			//   value
-			// This must be a multi-line string.
-			return d.decodeMultiLineString(v, currentIndent)
-
-		default:
-			// Should be impossible
-			return fmt.Errorf("%w: unknown line type %v", ErrSyntax, line.lineType)
+		text := l[indent:]
+		if text[0] == '#' {
+			continue // full-line comment, at any indentation
 		}
+		lines = append(lines, rawLine{indent: indent, text: text, num: num})
 	}
+	return &parser{lines: lines}, nil
 }
 
-// decodeObject unmarshals into a struct or map.
-func (d *Decoder) decodeObject(v reflect.Value, currentIndent int) error {
-	v = indirect(v, true) // forceAlloc=true to create nil struct pointers
+func (p *parser) peek() *rawLine {
+	if p.pos >= len(p.lines) {
+		return nil
+	}
+	return &p.lines[p.pos]
+}
+
+func (p *parser) consume() {
+	p.pos++
+}
+
+// nextContentLine returns the next non-blank line without consuming anything.
+func (p *parser) nextContentLine() *rawLine {
+	for i := p.pos; i < len(p.lines); i++ {
+		if !p.lines[i].blank {
+			return &p.lines[i]
+		}
+	}
+	return nil
+}
+
+// scalar is the parsed value part of a key or array-item line.
+type scalar struct {
+	text   string
+	quoted bool
+	empty  bool
+}
+
+// parseScalar interprets everything after "(key)" or ">" on a line:
+// quoting, inline comments, and the \# escape.
+func parseScalar(rest string) scalar {
+	s := strings.TrimSpace(rest)
+	if s == "" {
+		return scalar{empty: true}
+	}
+
+	if s[0] == '"' {
+		// A value is quoted only when the quotes cleanly wrap it: the LAST
+		// '"' on the line is followed by nothing but whitespace or an
+		// inline comment. Anything else falls through and the value is
+		// ordinary literal text, quotes included.
+		last := strings.LastIndexByte(s, '"')
+		if last > 0 {
+			tail := s[last+1:]
+			trimmed := strings.TrimSpace(tail)
+			if trimmed == "" || (strings.HasPrefix(trimmed, "#") && len(tail) > len(trimmed)) {
+				return scalar{text: s[1:last], quoted: true}
+			}
+		}
+	}
+
+	if s[0] == '#' {
+		// The whole value position is a comment.
+		return scalar{empty: true}
+	}
+
+	// Inline comment: '#' preceded by whitespace. A '\#' never matches
+	// because its preceding character is a backslash.
+	for i := 1; i < len(s); i++ {
+		if s[i] == '#' && (s[i-1] == ' ' || s[i-1] == '\t') {
+			s = strings.TrimRight(s[:i], " \t")
+			break
+		}
+	}
+	s = strings.ReplaceAll(s, `\#`, "#")
+	if s == "" {
+		return scalar{empty: true}
+	}
+	return scalar{text: s}
+}
+
+// decodeObject decodes key lines at exactly `indent` into a struct, map,
+// or empty interface.
+func (p *parser) decodeObject(v reflect.Value, indent int) error {
+	v = indirect(v, true)
 	if !v.IsValid() {
-		return errors.New("piml: cannot unmarshal into invalid value")
+		return fmt.Errorf("piml: cannot unmarshal into invalid value")
+	}
+
+	// Schemaless decode: materialize a map[string]interface{}.
+	if v.Kind() == reflect.Interface && v.NumMethod() == 0 {
+		m := map[string]interface{}{}
+		mv := reflect.ValueOf(&m)
+		if err := p.decodeObject(mv, indent); err != nil {
+			return err
+		}
+		v.Set(reflect.ValueOf(m))
+		return nil
 	}
 
 	isMap := v.Kind() == reflect.Map
 	isStruct := v.Kind() == reflect.Struct
-
 	if !isMap && !isStruct {
 		return fmt.Errorf("piml: cannot unmarshal object into %s", v.Kind())
 	}
-
 	if isMap {
 		if v.Type().Key().Kind() != reflect.String {
-			return errors.New("piml: map key must be string")
+			return fmt.Errorf("piml: map key must be string")
 		}
 		if v.IsNil() {
 			v.Set(reflect.MakeMap(v.Type()))
 		}
 	}
 
+	seen := map[string]bool{}
+
 	for {
-		line, err := d.peek()
-		if err != nil {
-			return err
-		}
+		line := p.peek()
 		if line == nil {
-			break
+			return nil
+		}
+		if line.blank {
+			p.consume()
+			continue
+		}
+		if line.indent < indent {
+			return nil // end of this object
+		}
+		if line.indent > indent {
+			return fmt.Errorf("%w: unexpected indentation, expected %d spaces, got %d (line %d)", ErrSyntax, indent, line.indent, line.num)
 		}
 
-		// Skip blank lines between fields
-		if line.lineType == lineBlank {
-			d.consume()
+		if line.text[0] != '(' {
+			return fmt.Errorf("%w: expected (key), got %q (line %d)", ErrSyntax, line.text, line.num)
+		}
+		closeParen := strings.IndexByte(line.text, ')')
+		if closeParen == -1 {
+			return fmt.Errorf("%w: invalid key format, missing ')' (line %d)", ErrSyntax, line.num)
+		}
+		key := line.text[1:closeParen]
+		if key == "" {
+			return fmt.Errorf("%w: empty key (line %d)", ErrSyntax, line.num)
+		}
+		if strings.ContainsRune(key, '(') {
+			return fmt.Errorf("%w: key %q contains '(' (line %d)", ErrSyntax, key, line.num)
+		}
+		if seen[key] {
+			return fmt.Errorf("%w: duplicate key %q (line %d)", ErrSyntax, key, line.num)
+		}
+		seen[key] = true
+
+		val := parseScalar(line.text[closeParen+1:])
+		p.consume()
+
+		// A key with an inline value cannot also have a block.
+		if !val.empty {
+			if next := p.nextContentLine(); next != nil && next.indent > indent {
+				return fmt.Errorf("%w: key %q has both a value and an indented block (line %d)", ErrSyntax, key, next.num)
+			}
+		}
+
+		// Resolve the decode target.
+		var target reflect.Value
+		found := true
+		if isStruct {
+			f, ferr := findStructField(v, key)
+			if ferr != nil {
+				found = false // unknown field: skip it (and its block)
+			} else {
+				target = f
+			}
+		} else {
+			target = reflect.New(v.Type().Elem())
+		}
+
+		if !found {
+			if val.empty {
+				p.skipBlock(indent)
+			}
 			continue
 		}
 
-		if line.indent <= currentIndent {
-			break // End of this object
-		}
-
-		if line.lineType != lineKeyValue && line.lineType != lineKeyOnly {
-			// This is a child of the object, it *must* be a key.
-			// e.g. Array items (>) are not allowed here.
-			return fmt.Errorf("%w: expected (key) or (key) value, got line type %v", ErrSyntax, line.lineType)
-		}
-
-		key := line.key
-
-		// Find the target field/map entry
-		var targetV reflect.Value
-		if isStruct {
-			targetV, err = findStructField(v, key)
-			if err != nil {
-				// Field not found, but we just consume and ignore
-				d.consume() // Consume the (key) or (key) value
-				// We also need to consume its children if it's (key) only
-				if line.lineType == lineKeyOnly {
-					d.consumeChildren(line.indent)
-				}
-				continue
-			}
-		} else if isMap {
-			// This is the new, robust logic
-			elemType := v.Type().Elem()
-			targetV = reflect.New(elemType)
-		} else {
-			// Should be impossible
-			return errors.New("piml: invalid state in decodeObject")
-		}
-
-		// We have our targetV (either a struct field or a map element)
-		if line.lineType == lineKeyValue {
-			// (key) value
-			d.consume() // Consume the line
-			if err := d.setPrimitive(targetV, line.value); err != nil {
+		if !val.empty {
+			if err := setScalar(target, val); err != nil {
 				return fmt.Errorf("piml: error setting field %q: %w", key, err)
 			}
 		} else {
-			// (key)
-			// This is a complex value, recurse
-			d.consume() // Consume the (key) line before recursing
-			if err := d.decodeValue(targetV, line.indent); err != nil {
+			if err := p.decodeBlock(target, indent); err != nil {
 				return fmt.Errorf("piml: error decoding field %q: %w", key, err)
 			}
 		}
 
-		// If it was a map, set the value in the map
 		if isMap {
-			// targetV is a *pointer* to the element type.
-			// We need to set the dereferenced element.
-			v.SetMapIndex(reflect.ValueOf(key), targetV.Elem())
+			v.SetMapIndex(reflect.ValueOf(key), target.Elem())
 		}
 	}
-
-	return nil
 }
 
-// decodeSlice unmarshals into a Go slice.
-func (d *Decoder) decodeSlice(v reflect.Value, currentIndent int) error {
-	v = indirect(v, false)
+// decodeBlock handles a bare key (or bare '>'): it inspects the following
+// block, decides its type from the first content line, and decodes it.
+// keyIndent is the indentation of the owning key/item line.
+func (p *parser) decodeBlock(v reflect.Value, keyIndent int) error {
+	next := p.nextContentLine()
+	if next == nil || next.indent <= keyIndent {
+		return setNilValue(v)
+	}
+	if next.indent != keyIndent+2 {
+		return fmt.Errorf("%w: expected %d spaces of indentation, got %d (line %d)", ErrSyntax, keyIndent+2, next.indent, next.num)
+	}
+	switch {
+	case strings.HasPrefix(next.text, `\(`), strings.HasPrefix(next.text, `\>`):
+		return p.decodeMultiline(v, keyIndent)
+	case next.text[0] == '(':
+		return p.decodeObject(v, keyIndent+2)
+	case next.text[0] == '>':
+		return p.decodeArray(v, keyIndent+2)
+	default:
+		return p.decodeMultiline(v, keyIndent)
+	}
+}
+
+// decodeArray decodes '>' item lines at exactly `indent` into a slice or
+// empty interface.
+func (p *parser) decodeArray(v reflect.Value, indent int) error {
+	v = indirect(v, true)
+
+	if v.Kind() == reflect.Interface && v.NumMethod() == 0 {
+		s := []interface{}{}
+		sv := reflect.ValueOf(&s)
+		if err := p.decodeArray(sv, indent); err != nil {
+			return err
+		}
+		v.Set(reflect.ValueOf(s))
+		return nil
+	}
+
 	if v.Kind() != reflect.Slice {
 		return fmt.Errorf("piml: cannot unmarshal array into %s", v.Kind())
 	}
-
-	// Clear the slice
 	v.Set(reflect.MakeSlice(v.Type(), 0, 0))
 	elemType := v.Type().Elem()
 
 	for {
-		line, err := d.peek()
-		if err != nil {
-			return err
-		}
+		line := p.peek()
 		if line == nil {
-			break
+			return nil
 		}
-
-		// Skip blank lines between array items
-		if line.lineType == lineBlank {
-			d.consume()
+		if line.blank {
+			p.consume()
 			continue
 		}
-
-		if line.indent <= currentIndent {
-			break // End of array
+		if line.indent < indent {
+			return nil // end of array
+		}
+		if line.indent > indent {
+			return fmt.Errorf("%w: unexpected indentation in array (line %d)", ErrSyntax, line.num)
+		}
+		if line.text[0] != '>' {
+			return fmt.Errorf("%w: expected array item '>', got %q (line %d)", ErrSyntax, line.text, line.num)
 		}
 
-		// Allocate a new element
-		// We pass a pointer to the element type to decodeValue/setPrimitive
-		elemVPtr := reflect.New(elemType)
+		val := parseScalar(line.text[1:])
 
-		if line.lineType == lineArrayObject {
-			// > (item)
-			// This is a list of objects.
-			d.consume() // Consume the '> (item)' line. It's just metadata.
-			// Now we decode the object *inside* the list item.
-			if err := d.decodeValue(elemVPtr, line.indent); err != nil {
-				return err
+		elemPtr := reflect.New(elemType)
+
+		if !val.empty {
+			// "> (label)" followed by a deeper block is an object item;
+			// the label is metadata and is ignored.
+			isLabel := !val.quoted && len(val.text) > 2 &&
+				val.text[0] == '(' && strings.IndexByte(val.text, ')') == len(val.text)-1
+			if isLabel {
+				if next := p.nextContentLineAfter(p.pos + 1); next != nil && next.indent > indent {
+					p.consume()
+					if err := p.decodeObject(elemPtr, indent+2); err != nil {
+						return err
+					}
+					v.Set(reflect.Append(v, elemPtr.Elem()))
+					continue
+				}
 			}
-		} else if line.lineType == lineArrayItem {
-			// > value
-			d.consume() // Consume the line
-			if err := d.setPrimitive(elemVPtr, line.value); err != nil {
+			p.consume()
+			if next := p.nextContentLine(); next != nil && next.indent > indent {
+				return fmt.Errorf("%w: array item has both a value and an indented block (line %d)", ErrSyntax, next.num)
+			}
+			if err := setScalar(elemPtr, val); err != nil {
 				return err
 			}
 		} else {
-			// This line is not an array item, so we're done.
-			break
+			p.consume()
+			if err := p.decodeBlock(elemPtr, indent); err != nil {
+				return err
+			}
 		}
 
-		// Append the new element (dereferenced from the pointer)
-		v.Set(reflect.Append(v, elemVPtr.Elem()))
+		v.Set(reflect.Append(v, elemPtr.Elem()))
 	}
+}
 
+// nextContentLineAfter returns the next non-blank line at or after index i.
+func (p *parser) nextContentLineAfter(i int) *rawLine {
+	for ; i < len(p.lines); i++ {
+		if !p.lines[i].blank {
+			return &p.lines[i]
+		}
+	}
 	return nil
 }
 
-// decodeSet unmarshals into a Go map[string]struct{}.
-func (d *Decoder) decodeSet(v reflect.Value, currentIndent int) error {
-	v = indirect(v, false)
-
-	// We'll treat sets as map[string]struct{} or map[string]bool
-	if v.Kind() != reflect.Map || v.Type().Key().Kind() != reflect.String {
-		return fmt.Errorf("piml: sets must be unmarshalled into map[string]struct{} or map[string]bool")
-	}
-
-	if v.IsNil() {
-		v.Set(reflect.MakeMap(v.Type()))
-	}
-
-	elemType := v.Type().Elem()
-	var setValue reflect.Value
-	if elemType.Kind() == reflect.Struct && elemType.NumField() == 0 {
-		// map[string]struct{}
-		setValue = reflect.New(elemType).Elem()
-	} else if elemType.Kind() == reflect.Bool {
-		// map[string]bool
-		setValue = reflect.ValueOf(true)
-	} else {
-		return fmt.Errorf("piml: set must be map[string]struct{} or map[string]bool, not %s", v.Type())
-	}
+// decodeMultiline decodes a multi-line string block owned by a key or item
+// at keyIndent. The base indent is keyIndent+2; deeper indentation is
+// content. Interior blank lines are preserved; leading and trailing
+// whitespace of the value is trimmed.
+func (p *parser) decodeMultiline(v reflect.Value, keyIndent int) error {
+	base := keyIndent + 2
+	var parts []string
+	pendingBlanks := 0
+	started := false
 
 	for {
-		line, err := d.peek()
-		if err != nil {
-			return err
-		}
+		line := p.peek()
 		if line == nil {
 			break
 		}
-
-		// Skip blank lines between set items
-		if line.lineType == lineBlank {
-			d.consume()
+		if line.blank {
+			p.consume()
+			if started {
+				pendingBlanks++
+			}
 			continue
 		}
-
-		if line.indent <= currentIndent {
-			break // End of set
+		if line.indent <= keyIndent {
+			break // end of block
 		}
-
-		if line.lineType != lineSetItem {
-			// This line is not a set item, we're done.
-			break
+		if line.indent < base {
+			return fmt.Errorf("%w: multi-line string content indented less than its base (line %d)", ErrSyntax, line.num)
 		}
+		p.consume()
 
-		d.consume()
-		keyV := reflect.ValueOf(line.value)
-		v.SetMapIndex(keyV, setValue)
+		content := strings.Repeat(" ", line.indent-base) + line.text
+		content = unescapeContentLine(content, !started)
+
+		for ; pendingBlanks > 0; pendingBlanks-- {
+			parts = append(parts, "")
+		}
+		parts = append(parts, content)
+		started = true
 	}
 
-	return nil
-}
+	result := strings.TrimRight(strings.Join(parts, "\n"), " \t")
 
-// decodeMultiLineString unmarshals a multi-line string.
-func (d *Decoder) decodeMultiLineString(v reflect.Value, currentIndent int) error {
-	v = indirect(v, true) // true = force allocation
-	if v.Kind() != reflect.String {
+	v = indirect(v, true)
+	switch {
+	case v.Kind() == reflect.String:
+		v.SetString(result)
+	case v.Kind() == reflect.Interface && v.NumMethod() == 0:
+		v.Set(reflect.ValueOf(result))
+	default:
 		return fmt.Errorf("piml: cannot unmarshal multi-line string into %s", v.Kind())
 	}
-
-	var b strings.Builder
-	var baseIndent = -1 // -1 means not set yet
-
-	for {
-		line, err := d.peek()
-		if err != nil {
-			return err
-		}
-		// Blank lines don't have indentation, so we skip the indent check for them.
-		if line == nil || (line.lineType != lineBlank && line.indent <= currentIndent) {
-			break // End of multi-line string
-		}
-
-		// A valid line for a multi-line string can be blank or have content.
-		if line.lineType != lineMultiLine && line.lineType != lineBlank {
-			break
-		}
-
-		d.consume()
-
-		// Every line after the first adds a newline separator.
-		if baseIndent != -1 {
-			b.WriteString("\n")
-		}
-
-		// Set base indent on the first line seen
-		if baseIndent == -1 {
-			baseIndent = line.indent
-		}
-
-		if line.lineType == lineBlank {
-			// It's a blank line, we've added the newline, so we're done with this line.
-			continue
-		}
-
-		// It's a line with content (lineMultiLine)
-		content := line.value
-
-		// Add the content, stripping the base indent
-		if len(content) >= baseIndent {
-			b.WriteString(content[baseIndent:])
-		} else {
-			// Should not happen if indent was calculated correctly, but as a fallback...
-			b.WriteString(strings.TrimSpace(content))
-		}
-	}
-
-	v.SetString(b.String())
 	return nil
 }
 
-// setPrimitive sets a primitive value (string, int, etc.)
-func (d *Decoder) setPrimitive(v reflect.Value, valueStr string) error {
-	// 1. Handle "nil" first.
-	if valueStr == "nil" {
-		if !v.CanSet() {
-			v = v.Elem()
+// unescapeContentLine removes the positional escapes from a multi-line
+// content line: \# anywhere a line starts (comment escape), and \( / \>
+// on the first line of a block (type-determination escapes).
+func unescapeContentLine(content string, firstLine bool) string {
+	i := 0
+	for i < len(content) && content[i] == ' ' {
+		i++
+	}
+	rest := content[i:]
+	if strings.HasPrefix(rest, `\#`) {
+		return content[:i] + rest[1:]
+	}
+	if firstLine && (strings.HasPrefix(rest, `\(`) || strings.HasPrefix(rest, `\>`)) {
+		return content[:i] + rest[1:]
+	}
+	return content
+}
+
+// skipBlock consumes all lines belonging to a block deeper than `indent`.
+func (p *parser) skipBlock(indent int) {
+	for {
+		line := p.peek()
+		if line == nil {
+			return
 		}
-		// Check if the target type can be nil
-		switch v.Kind() {
-		case reflect.Ptr, reflect.Slice, reflect.Map, reflect.Interface:
-			if !v.IsNil() {
-				v.Set(reflect.Zero(v.Type())) // Set to nil
+		if line.blank || line.indent > indent {
+			p.consume()
+			continue
+		}
+		return
+	}
+}
+
+// setScalar stores a parsed scalar into v, honoring the target type in
+// schema mode and the spec's inference rules for interface{} targets.
+func setScalar(v reflect.Value, val scalar) error {
+	// nil first: it needs the original (possibly pointer) value.
+	if !val.quoted && val.text == "nil" {
+		return setNilValue(v)
+	}
+
+	v = indirect(v, true)
+
+	if v.Kind() == reflect.Interface && v.NumMethod() == 0 {
+		v.Set(reflect.ValueOf(inferValue(val)))
+		return nil
+	}
+
+	if val.quoted {
+		// A quoted value is a string; it only fits string-shaped targets.
+		switch {
+		case v.Kind() == reflect.String:
+			v.SetString(val.text)
+			return nil
+		case v.Type() == reflect.TypeOf(time.Time{}):
+			t, err := time.Parse(time.RFC3339Nano, val.text)
+			if err != nil {
+				return fmt.Errorf("piml: invalid time format: %w", err)
 			}
+			v.Set(reflect.ValueOf(t))
 			return nil
 		default:
-			// Trying to assign nil to a non-nillable type
-			return fmt.Errorf("piml: cannot assign nil to non-nillable type %s", v.Type())
+			return fmt.Errorf("piml: cannot unmarshal quoted string into %s", v.Kind())
 		}
 	}
 
-	// 2. Dereference pointer
-	v = indirect(v, true) // true = force allocation
-
-	// 3. Set value based on kind
+	valueStr := val.text
 	switch v.Kind() {
 	case reflect.String:
 		v.SetString(valueStr)
@@ -535,12 +538,15 @@ func (d *Decoder) setPrimitive(v reflect.Value, valueStr string) error {
 		}
 		v.SetFloat(f)
 	case reflect.Bool:
-		b, err := strconv.ParseBool(valueStr)
-		if err != nil {
-			return fmt.Errorf("piml: invalid boolean value: %w", err)
+		switch valueStr {
+		case "true":
+			v.SetBool(true)
+		case "false":
+			v.SetBool(false)
+		default:
+			return fmt.Errorf("piml: invalid boolean value: %q (only lowercase true/false)", valueStr)
 		}
-		v.SetBool(b)
-	case reflect.Struct: // <-- NEW CASE
+	case reflect.Struct:
 		if v.Type() == reflect.TypeOf(time.Time{}) {
 			t, err := time.Parse(time.RFC3339Nano, valueStr)
 			if err != nil {
@@ -556,6 +562,43 @@ func (d *Decoder) setPrimitive(v reflect.Value, valueStr string) error {
 	return nil
 }
 
+// inferValue applies the spec's schemaless type inference.
+func inferValue(val scalar) interface{} {
+	if val.quoted {
+		return val.text
+	}
+	s := val.text
+	switch {
+	case s == "true":
+		return true
+	case s == "false":
+		return false
+	case intPattern.MatchString(s):
+		i, _ := strconv.ParseInt(s, 10, 64)
+		return i
+	case floatPattern.MatchString(s):
+		f, _ := strconv.ParseFloat(s, 64)
+		return f
+	}
+	return s
+}
+
+// setNilValue sets v to nil, erroring for non-nillable targets.
+func setNilValue(v reflect.Value) error {
+	if !v.CanSet() && v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	switch v.Kind() {
+	case reflect.Ptr, reflect.Slice, reflect.Map, reflect.Interface:
+		if !v.IsNil() {
+			v.Set(reflect.Zero(v.Type()))
+		}
+		return nil
+	default:
+		return fmt.Errorf("piml: cannot assign nil to non-nillable type %s", v.Type())
+	}
+}
+
 // indirect dereferences pointers until it gets a non-pointer.
 // If forceAlloc is true, it will allocate new pointers.
 func indirect(v reflect.Value, forceAlloc bool) reflect.Value {
@@ -564,7 +607,7 @@ func indirect(v reflect.Value, forceAlloc bool) reflect.Value {
 			if forceAlloc {
 				v.Set(reflect.New(v.Type().Elem()))
 			} else {
-				return v // Return the nil pointer
+				return v
 			}
 		}
 		v = v.Elem()
@@ -579,13 +622,11 @@ func findStructField(v reflect.Value, key string) (reflect.Value, error) {
 		fieldT := t.Field(i)
 		fieldV := v.Field(i)
 
-		// 1. Check tag
 		tag := fieldT.Tag.Get("piml")
 		if tag == "-" {
 			continue
 		}
 
-		// Parse tag to get the name
 		tagName := tag
 		if idx := strings.Index(tag, ","); idx != -1 {
 			tagName = tag[:idx]
@@ -595,37 +636,15 @@ func findStructField(v reflect.Value, key string) (reflect.Value, error) {
 			return fieldV, nil
 		}
 
-		// 2. Check default name (if no tag)
 		if tag == "" && strings.ToLower(fieldT.Name) == key {
 			return fieldV, nil
 		}
 
-		// 3. Recurse into anonymous/embedded structs *regardless* of tag
-		// Note: This logic for embedded structs is simplified and might not handle
-		// all edge cases of shadowing, but it fits the current style.
 		if fieldT.Anonymous && fieldT.Type.Kind() == reflect.Struct {
 			if f, err := findStructField(fieldV, key); err == nil {
-				return f, nil // Found in embedded struct
+				return f, nil
 			}
 		}
 	}
-	// Return a zero Value to indicate not found
 	return reflect.Value{}, fmt.Errorf("field %q not found", key)
-}
-
-// consumeChildren peeks and consumes all lines that are
-// indented more than the given indent.
-func (d *Decoder) consumeChildren(currentIndent int) {
-	for {
-		line, err := d.peek()
-		if err != nil || line == nil {
-			return // EOF or error
-		}
-
-		if line.indent > currentIndent {
-			d.consume()
-		} else {
-			return // We found a line at our level or above
-		}
-	}
 }

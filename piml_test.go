@@ -242,21 +242,21 @@ func TestKeysWithSpaces(t *testing.T) {
 func TestCommentHandling(t *testing.T) {
 	pimlData := []byte(`
 # This is a full-line comment
-(host) localhost # This is now part of the value
+(host) localhost # This is an inline comment
 # Another comment
 (port) 5432
 (description)
-  This is a multi-line string. # Comments are allowed here
-  # And on their own line.
-  Even with weird indentation.
+  This is a multi-line string. # hashes on content lines are literal
+  # Comment lines are still dropped inside blocks.
+  Even more text.
 `)
 	var output DBConfig
 	if err := Unmarshal(pimlData, &output); err != nil {
 		t.Fatalf("Unmarshal() error = %v", err)
 	}
 
-	if output.Host != "localhost # This is now part of the value" {
-		t.Errorf("Expected Host 'localhost # This is now part of the value', got %q", output.Host)
+	if output.Host != "localhost" {
+		t.Errorf("Expected Host 'localhost', got %q", output.Host)
 	}
 	if output.Port != 5432 {
 		t.Errorf("Expected Port 5432, got %d", output.Port)
@@ -680,7 +680,6 @@ func TestMultineStringCorrectly(t *testing.T) {
 		}
 	}
 }
-
 
 func TestComments(t *testing.T) {
 	type Config struct {

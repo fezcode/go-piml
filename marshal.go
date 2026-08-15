@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -24,149 +25,130 @@ func NewEncoder(w io.Writer) *Encoder {
 func (e *Encoder) Encode(v interface{}) error {
 	rv := reflect.ValueOf(v)
 	// Start with indent -1 to signify the root.
-	return e.encodeValue(rv, -1, false) // false = not in an array
+	return e.encodeValue(rv, -1, false)
+}
+
+func (e *Encoder) write(s string) error {
+	_, err := e.w.Write([]byte(s))
+	return err
+}
+
+func indentOf(level int) string {
+	if level <= 0 {
+		return ""
+	}
+	return strings.Repeat("  ", level)
+}
+
+// resolve unwraps pointers and interfaces to the concrete value.
+func resolve(v reflect.Value) reflect.Value {
+	for {
+		if v.Kind() == reflect.Ptr && !v.IsNil() {
+			v = v.Elem()
+			continue
+		}
+		if v.Kind() == reflect.Interface && !v.IsNil() {
+			v = v.Elem()
+			continue
+		}
+		return v
+	}
 }
 
 // encodeValue is the main recursive marshalling function.
 func (e *Encoder) encodeValue(v reflect.Value, indent int, inArray bool) error {
-	// Handle nil and empty values
 	if !v.IsValid() || isNilOrEmpty(v) {
 		if inArray {
-			// This case should be handled by encodeSlice
-			return nil
+			return e.write(fmt.Sprintf("%s> nil\n", indentOf(indent)))
 		}
-		// Not in an array, so it's a value for a key.
-		// The key itself is written by encodeStruct, here we just write 'nil'.
-		_, err := e.w.Write([]byte(" nil\n"))
-		return err
+		return e.write(" nil\n")
 	}
 
-	// This is only used for array items
-	var indentStr string
-	if indent > 0 {
-		indentStr = strings.Repeat("  ", indent)
-	}
+	v = resolve(v)
+	indentStr := indentOf(indent)
 
-	// Dereference pointers
-	for v.Kind() == reflect.Ptr {
-		v = v.Elem()
-	}
-
-	// Dispatch based on type
 	switch v.Kind() {
 	case reflect.Struct:
-		// NEW CHECK: Handle time.Time as a primitive string
+		// time.Time marshals as an RFC3339Nano scalar.
 		if v.Type() == reflect.TypeOf(time.Time{}) {
 			s := v.Interface().(time.Time).Format(time.RFC3339Nano)
-			if inArray {
-				_, err := e.w.Write([]byte(fmt.Sprintf("%s> %s\n", indentStr, s)))
-				return err
-			}
-			_, err := e.w.Write([]byte(fmt.Sprintf(" %s\n", s)))
-			return err
+			return e.writeRawScalar(s, indent, inArray)
 		}
-
-		// If we're marshalling a struct inside an array, we must add the '>'
 		if inArray {
-			// e.g., > (item)
-			// The key (e.g., "item") is metadata, per our spec.
-			// We'll use the struct's type name, or "item".
+			// The label is readability metadata; parsers ignore it.
 			itemName := v.Type().Name()
 			if itemName == "" {
 				itemName = "item"
 			}
-			if _, err := e.w.Write([]byte(fmt.Sprintf("%s> (%s)\n", indentStr, itemName))); err != nil {
+			if err := e.write(fmt.Sprintf("%s> (%s)\n", indentStr, itemName)); err != nil {
 				return err
-			}
-			// Now encode the struct's fields, one level deeper
-			return e.encodeStruct(v, indent+1)
-		} else {
-			// A top-level struct or nested struct field.
-			// The keys will be indented *by* encodeStruct.
-			// If we are nested (indent > -1), we need a newline first.
-			if indent > -1 {
-				if _, err := e.w.Write([]byte("\n")); err != nil {
-					return err
-				}
 			}
 			return e.encodeStruct(v, indent)
 		}
-
-	case reflect.Slice, reflect.Array:
-		// We need a newline if we are not in an array
-		if !inArray {
-			if _, err := e.w.Write([]byte("\n")); err != nil {
+		if indent > -1 {
+			if err := e.write("\n"); err != nil {
 				return err
 			}
 		}
-		return e.encodeSlice(v, indent+1) // Slices items are one level deeper
+		return e.encodeStruct(v, indent)
 
-	case reflect.Map:
-		// Per our spec, map keys are PIML keys.
-		// This is just like a struct.
-		if !inArray {
-			if _, err := e.w.Write([]byte("\n")); err != nil {
+	case reflect.Slice, reflect.Array:
+		if inArray {
+			// A nested list: bare '>' with its items one level deeper.
+			if err := e.write(fmt.Sprintf("%s>\n", indentStr)); err != nil {
 				return err
 			}
+			return e.encodeSliceItems(v, indent+1)
+		}
+		if err := e.write("\n"); err != nil {
+			return err
+		}
+		return e.encodeSliceItems(v, indent+1)
+
+	case reflect.Map:
+		if inArray {
+			if err := e.write(fmt.Sprintf("%s> (item)\n", indentStr)); err != nil {
+				return err
+			}
+			return e.encodeMap(v, indent)
+		}
+		if err := e.write("\n"); err != nil {
+			return err
 		}
 		return e.encodeMap(v, indent)
 
 	case reflect.String:
-		return e.encodeString(v, indent, inArray)
+		return e.encodeString(v.String(), indent, inArray)
 
-	// Primitives
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		s := strconv.FormatInt(v.Int(), 10)
-		if inArray {
-			_, err := e.w.Write([]byte(fmt.Sprintf("%s> %s\n", indentStr, s)))
-			return err
-		}
-		_, err := e.w.Write([]byte(fmt.Sprintf(" %s\n", s)))
-		return err
-
+		return e.writeRawScalar(strconv.FormatInt(v.Int(), 10), indent, inArray)
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		s := strconv.FormatUint(v.Uint(), 10)
-		if inArray {
-			_, err := e.w.Write([]byte(fmt.Sprintf("%s> %s\n", indentStr, s)))
-			return err
-		}
-		_, err := e.w.Write([]byte(fmt.Sprintf(" %s\n", s)))
-		return err
-
+		return e.writeRawScalar(strconv.FormatUint(v.Uint(), 10), indent, inArray)
 	case reflect.Float32, reflect.Float64:
-		s := strconv.FormatFloat(v.Float(), 'f', -1, 64)
-		if inArray {
-			_, err := e.w.Write([]byte(fmt.Sprintf("%s> %s\n", indentStr, s)))
-			return err
-		}
-		_, err := e.w.Write([]byte(fmt.Sprintf(" %s\n", s)))
-		return err
-
+		return e.writeRawScalar(strconv.FormatFloat(v.Float(), 'f', -1, 64), indent, inArray)
 	case reflect.Bool:
-		s := strconv.FormatBool(v.Bool())
-		if inArray {
-			_, err := e.w.Write([]byte(fmt.Sprintf("%s> %s\n", indentStr, s)))
-			return err
-		}
-		_, err := e.w.Write([]byte(fmt.Sprintf(" %s\n", s)))
-		return err
+		return e.writeRawScalar(strconv.FormatBool(v.Bool()), indent, inArray)
 
 	default:
 		return fmt.Errorf("%w: %s", ErrUnsupportedType, v.Kind())
 	}
 }
 
+// writeRawScalar emits a non-string scalar (numbers, booleans, times),
+// which is never quoted.
+func (e *Encoder) writeRawScalar(s string, indent int, inArray bool) error {
+	if inArray {
+		return e.write(fmt.Sprintf("%s> %s\n", indentOf(indent), s))
+	}
+	return e.write(fmt.Sprintf(" %s\n", s))
+}
+
 // encodeStruct handles marshalling a Go struct to PIML.
+// `indent` is the level of the struct's own key line; fields go one deeper.
 func (e *Encoder) encodeStruct(v reflect.Value, indent int) error {
 	t := v.Type()
-	// The fields of a struct are indented one level deeper than the struct's key.
-	// For the root, indent = -1, so fieldIndent = 0.
-	// For a nested struct, indent = 0, so fieldIndent = 1.
 	fieldIndent := indent + 1
-	var indentStr string
-	if fieldIndent > 0 {
-		indentStr = strings.Repeat("  ", fieldIndent)
-	}
+	indentStr := indentOf(fieldIndent)
 
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
@@ -174,7 +156,7 @@ func (e *Encoder) encodeStruct(v reflect.Value, indent int) error {
 
 		tag := field.Tag.Get("piml")
 		if tag == "-" {
-			continue // Skip this field
+			continue
 		}
 
 		tagName := tag
@@ -185,21 +167,20 @@ func (e *Encoder) encodeStruct(v reflect.Value, indent int) error {
 				omitempty = true
 			}
 		}
-
 		if tagName == "" {
 			tagName = strings.ToLower(field.Name)
+		}
+		if strings.ContainsAny(tagName, "()") {
+			return fmt.Errorf("piml: key %q may not contain parentheses", tagName)
 		}
 
 		if omitempty && isEmptyValue(fieldV) {
 			continue
 		}
 
-		// Write the key
-		if _, err := e.w.Write([]byte(fmt.Sprintf("%s(%s)", indentStr, tagName))); err != nil {
+		if err := e.write(fmt.Sprintf("%s(%s)", indentStr, tagName)); err != nil {
 			return err
 		}
-
-		// Write the value
 		if err := e.encodeValue(fieldV, fieldIndent, false); err != nil {
 			return err
 		}
@@ -207,156 +188,149 @@ func (e *Encoder) encodeStruct(v reflect.Value, indent int) error {
 	return nil
 }
 
-// encodeSlice handles marshalling a Go slice to PIML.
-func (e *Encoder) encodeSlice(v reflect.Value, indent int) error {
-	if v.Len() == 0 {
-		return nil // Handled by isNilOrEmpty in encodeValue
-	}
-
-	// We'll peek at the first element
-	elemType := v.Type().Elem()
-	if elemType.Kind() == reflect.Ptr {
-		elemType = elemType.Elem()
-	}
-
-	switch elemType.Kind() {
-	case reflect.Struct:
-		// List of Objects
-		for i := 0; i < v.Len(); i++ {
-			elemV := v.Index(i)
-			// Pass 'true' for inArray
-			if err := e.encodeValue(elemV, indent, true); err != nil {
-				return err
-			}
-		}
-	default:
-		// List of Primitives
-		var indentStr string
-		if indent > 0 {
-			indentStr = strings.Repeat("  ", indent)
-		}
-		for i := 0; i < v.Len(); i++ {
-			elemV := v.Index(i)
-			// Pass 'true' for inArray, but we re-implement the primitive
-			// logic here to write the '>'.
-			if err := e.writePrimitiveArrayItem(elemV, indentStr); err != nil {
-				return err
-			}
+// encodeSliceItems writes the '>' items of a slice at the given level.
+func (e *Encoder) encodeSliceItems(v reflect.Value, indent int) error {
+	for i := 0; i < v.Len(); i++ {
+		if err := e.encodeValue(v.Index(i), indent, true); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// encodeMap handles marshalling a Go map to PIML.
-// This is just like a struct.
+// encodeMap handles marshalling a Go map to PIML, with sorted keys for
+// deterministic output. `indent` is the level of the map's own key line.
 func (e *Encoder) encodeMap(v reflect.Value, indent int) error {
-	// Maps are encoded just like structs.
 	fieldIndent := indent + 1
-	var indentStr string
-	if fieldIndent > 0 {
-		indentStr = strings.Repeat("  ", fieldIndent)
-	}
+	indentStr := indentOf(fieldIndent)
 
-	// Note: Map iteration is not stable, so output may vary.
+	keys := make([]string, 0, v.Len())
 	for _, key := range v.MapKeys() {
-		val := v.MapIndex(key)
 		keyStr, ok := key.Interface().(string)
 		if !ok {
 			return errors.New("piml: map keys must be strings")
 		}
+		keys = append(keys, keyStr)
+	}
+	sort.Strings(keys)
 
-		// Write the key
-		if _, err := e.w.Write([]byte(fmt.Sprintf("%s(%s)", indentStr, keyStr))); err != nil {
+	for _, keyStr := range keys {
+		if keyStr == "" || strings.ContainsAny(keyStr, "()") {
+			return fmt.Errorf("piml: key %q may not be empty or contain parentheses", keyStr)
+		}
+		if err := e.write(fmt.Sprintf("%s(%s)", indentStr, keyStr)); err != nil {
 			return err
 		}
-		// Write the value
-		if err := e.encodeValue(val, fieldIndent, false); err != nil {
+		if err := e.encodeValue(v.MapIndex(keyStr2Value(keyStr, v)), fieldIndent, false); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// encodeString handles marshalling a string.
-// It detects multi-line strings.
-func (e *Encoder) encodeString(v reflect.Value, indent int, inArray bool) error {
-	s := v.String()
-	var indentStr string
-	if indent > 0 {
-		indentStr = strings.Repeat("  ", indent)
-	}
+// keyStr2Value builds the reflect key value for a map lookup.
+func keyStr2Value(keyStr string, m reflect.Value) reflect.Value {
+	return reflect.ValueOf(keyStr).Convert(m.Type().Key())
+}
+
+// encodeString handles marshalling a string, quoting or block-forming it
+// so that it round-trips under the v1.2.0 parsing rules.
+func (e *Encoder) encodeString(s string, indent int, inArray bool) error {
+	indentStr := indentOf(indent)
 
 	if strings.Contains(s, "\n") {
-		// --- Multi-line String ---
+		// --- Multi-line string block ---
 		if inArray {
-			// This is tricky. A multi-line string in an array?
-			// Let's just use > for the first line
-			_, err := e.w.Write([]byte(fmt.Sprintf("%s> ... (multi-line not fully supported in array yet)\n", indentStr)))
-			return err
-		}
-		// Write key (already written by caller), then newline
-		if _, err := e.w.Write([]byte("\n")); err != nil {
-			return err
-		}
-		// Write each line indented
-		lines := strings.Split(s, "\n")
-		lineIndent := indent + 1
-		var lineIndentStr string
-		if lineIndent > 0 {
-			lineIndentStr = strings.Repeat("  ", lineIndent)
-		}
-		for _, line := range lines {
-			// Escape any line that starts with # to prevent it being parsed as a comment.
-			if strings.HasPrefix(line, "#") {
-				line = `\` + line
+			if err := e.write(fmt.Sprintf("%s>\n", indentStr)); err != nil {
+				return err
 			}
-			if _, err := e.w.Write([]byte(fmt.Sprintf("%s%s\n", lineIndentStr, line))); err != nil {
+		} else {
+			if err := e.write("\n"); err != nil {
+				return err
+			}
+		}
+		lineIndentStr := indentOf(indent + 1)
+		for i, line := range strings.Split(s, "\n") {
+			if strings.TrimSpace(line) == "" {
+				if err := e.write("\n"); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := e.write(fmt.Sprintf("%s%s\n", lineIndentStr, escapeContentLine(line, i == 0))); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 
-	// --- Single-line String ---
-	if inArray {
-		_, err := e.w.Write([]byte(fmt.Sprintf("%s> %s\n", indentStr, s)))
-		return err
+	// --- Single-line string ---
+	out := s
+	if needsQuoting(s) {
+		out = `"` + s + `"`
 	}
-	_, err := e.w.Write([]byte(fmt.Sprintf(" %s\n", s)))
-	return err
+	if inArray {
+		return e.write(fmt.Sprintf("%s> %s\n", indentStr, out))
+	}
+	return e.write(fmt.Sprintf(" %s\n", out))
 }
 
-// writePrimitiveArrayItem is a helper for encodeSlice
-func (e *Encoder) writePrimitiveArrayItem(v reflect.Value, indentStr string) error {
-	for v.Kind() == reflect.Ptr {
-		v = v.Elem()
+// escapeContentLine applies the positional escapes a multi-line content
+// line needs to survive parsing: a leading '#' always, and a leading '('
+// or '>' on the first line only.
+func escapeContentLine(line string, firstLine bool) string {
+	i := 0
+	for i < len(line) && line[i] == ' ' {
+		i++
 	}
-
-	var s string
-	switch v.Kind() {
-	case reflect.String:
-		s = v.String()
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		s = strconv.FormatInt(v.Int(), 10)
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		s = strconv.FormatUint(v.Uint(), 10)
-	case reflect.Float32, reflect.Float64:
-		s = strconv.FormatFloat(v.Float(), 'f', -1, 64)
-	case reflect.Bool:
-		s = strconv.FormatBool(v.Bool())
-	default:
-		return fmt.Errorf("%w: %s", ErrUnsupportedType, v.Kind())
+	rest := line[i:]
+	if strings.HasPrefix(rest, "#") {
+		return line[:i] + `\` + rest
 	}
+	if firstLine && (strings.HasPrefix(rest, "(") || strings.HasPrefix(rest, ">")) {
+		return line[:i] + `\` + rest
+	}
+	return line
+}
 
-	_, err := e.w.Write([]byte(fmt.Sprintf("%s> %s\n", indentStr, s)))
-	return err
+// needsQuoting reports whether a single-line string value must be quoted
+// to parse back as the same string.
+func needsQuoting(s string) bool {
+	if s == "" {
+		return true
+	}
+	if s != strings.TrimSpace(s) {
+		return true // leading/trailing whitespace would be trimmed
+	}
+	switch s {
+	case "nil", "true", "false":
+		return true
+	}
+	if intPattern.MatchString(s) || floatPattern.MatchString(s) {
+		return true
+	}
+	if s[0] == '"' || s[0] == '#' {
+		return true
+	}
+	if strings.Contains(s, `\#`) {
+		return true // would be unescaped to '#'
+	}
+	for i := 1; i < len(s); i++ {
+		if s[i] == '#' && (s[i-1] == ' ' || s[i-1] == '\t') {
+			return true // would start an inline comment
+		}
+	}
+	return false
 }
 
 // isNilOrEmpty checks if a reflect.Value is nil, or an empty slice/map.
 func isNilOrEmpty(v reflect.Value) bool {
 	switch v.Kind() {
 	case reflect.Ptr, reflect.Interface:
-		return v.IsNil()
+		if v.IsNil() {
+			return true
+		}
+		return isNilOrEmpty(v.Elem())
 	case reflect.Slice, reflect.Map:
 		return v.IsNil() || v.Len() == 0
 	}

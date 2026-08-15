@@ -2,17 +2,30 @@
 
 `go-piml` is a Go package that provides functionality to marshal and unmarshal data to and from the PIML (Parenthesis Intended Markup Language) format. PIML is a human-readable, indentation-based data serialization format designed for configuration files and simple data structures.
 
+Implements **PIML spec v1.2.0** — see the [spec repository](https://github.com/fezcode/piml). Conformance is verified against the shared compliance suite.
+
 ## Features
 
 -   **Intuitive Syntax:** Easy-to-read key-value pairs, supporting nested structures.
 -   **Go-like Tagging:** Uses `piml:"tag"` struct tags for flexible field mapping.
 -   **Primitive Types:** Supports strings, integers, floats, and booleans.
--   **Complex Types:** Handles structs, slices (arrays), and maps.
--   **Nil Handling:** Explicitly represents `nil` for pointers, empty slices, and empty maps.
+-   **Quoted Strings:** `(zip) "08080"` forces a string value where inference would produce another type.
+-   **Schemaless Decoding:** Unmarshals into `map[string]interface{}` / `interface{}` using the spec's type inference rules.
+-   **Complex Types:** Handles structs, slices (arrays), maps, nested lists, and multi-line strings inside arrays.
+-   **Nil Handling:** `nil` (and bare keys) represent null, empty slices, and empty maps.
 -   **Omitempty Support:** Supports the `omitempty` struct tag option to skip fields with zero/empty values during marshalling.
--   **Multi-line Strings:** Supports multi-line string values with indentation.
--   **Comments:** Allows single-line comments (lines starting with `#`). Inline comments are not supported. In multi-line strings, a leading `#` can be escaped with a backslash (`\#`) to be treated as a literal character.
+-   **Multi-line Strings:** Base indent is key + 2; deeper indentation is preserved; the end of the value is trimmed.
+-   **Comments:** Full-line comments (`#` at line start, any indentation) and inline comments (whitespace + `#`). A `#` glued to text is literal; escape with `\#` where needed.
+-   **Strict Indentation:** Exactly 2 spaces per level; tabs and skipped levels are syntax errors, as are duplicate keys.
 -   **Time Support:** Marshals and unmarshals `time.Time` values using RFC3339Nano format.
+
+### Breaking changes in v1.3.0 (spec v1.2.0)
+
+-   Inline comments are now stripped from values (`(host) localhost # note` → `"localhost"`).
+-   Duplicate keys, tabs, and non-2-space indentation are now errors.
+-   A bare `(key)` decodes as `nil` instead of being ignored.
+-   Booleans accept only lowercase `true`/`false`.
+-   The undocumented `>|` set syntax has been removed.
 
 ## PIML Format Overview
 
@@ -195,6 +208,22 @@ Output:
 description for the site.}
 Admin: ID=1, Name=Admin One
 Admin: ID=2, Name=Admin Two
+```
+
+### Schemaless Decoding
+
+Without a struct, PIML decodes into a `map[string]interface{}` using the spec's type inference (int64, float64, bool, nil, string):
+
+```go
+var doc map[string]interface{}
+err := piml.Unmarshal([]byte(`
+(port) 8080
+(zip) "08080"
+(tags)
+  > auth
+  > logging
+`), &doc)
+// doc["port"] == int64(8080), doc["zip"] == "08080"
 ```
 
 ## Contributing
